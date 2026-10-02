@@ -4,6 +4,7 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import com.nuvio.tv.core.profile.ProfileManager
+import com.nuvio.tv.reshaped.livetv.IPTV_VOD_BINGE_GROUP_PREFIX
 import kotlinx.coroutines.flow.first
 import org.json.JSONArray
 import org.json.JSONObject
@@ -54,6 +55,12 @@ class StreamLinkCacheDataStore @Inject constructor(
         contentLanguage: String? = null,
         year: String? = null
     ) {
+        // IPTV links embed credentials and must be resolved against the current saved account.
+        // Reusing them would also bypass the stream's fresh sidecar subtitle metadata.
+        if (bingeGroup?.startsWith(IPTV_VOD_BINGE_GROUP_PREFIX) == true) {
+            store().edit { it.remove(cachePrefKey(contentKey)) }
+            return
+        }
         val payload = JSONObject().apply {
             put("url", url)
             put("streamName", streamName)
@@ -83,6 +90,7 @@ class StreamLinkCacheDataStore @Inject constructor(
 
         val parsed = runCatching {
             val json = JSONObject(raw)
+            if (json.optString("bingeGroup").startsWith(IPTV_VOD_BINGE_GROUP_PREFIX)) return@runCatching null
             val cachedAtMs = json.optLong("cachedAtMs", 0L)
             val age = System.currentTimeMillis() - cachedAtMs
             if (cachedAtMs <= 0L || age > maxAgeMs) return@runCatching null

@@ -283,6 +283,25 @@ class TmdbService @Inject constructor(
 
     fun apiKey(): String = TMDB_API_KEY
 
+    /** Minimal identity for matching external catalogs without fetching enrichment/credits. */
+    internal suspend fun fetchMediaIdentity(tmdbId: String, mediaType: String): TmdbMediaIdentity? {
+        val id = tmdbId.toIntOrNull()?.takeIf { it > 0 } ?: return null
+        return try {
+            val movie = normalizeMediaType(mediaType) == "movie"
+            val response = if (movie) tmdbApi.getMovieDetails(id, TMDB_API_KEY) else tmdbApi.getTvDetails(id, TMDB_API_KEY)
+            val details = response.takeIf { it.isSuccessful }?.body()?.takeIf { it.id == id } ?: return null
+            TmdbMediaIdentity(
+                titles = listOfNotNull(details.title, details.name, details.originalTitle, details.originalName)
+                    .map(String::trim).filter(String::isNotEmpty).toSet(),
+                year = (if (movie) details.releaseDate else details.firstAirDate)?.take(4)?.toIntOrNull(),
+            )
+        } catch (cancel: CancellationException) {
+            throw cancel
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     /**
      * Fetches backdrop and poster URLs from TMDB for the given IMDB ID.
      * Returns null if the IMDB ID doesn't start with "tt" or if TMDB has no data.
@@ -309,3 +328,5 @@ class TmdbService @Inject constructor(
 }
 
 data class TmdbImages(val backdropUrl: String?, val posterUrl: String?, val runtimeMinutes: Int? = null)
+
+internal data class TmdbMediaIdentity(val titles: Set<String>, val year: Int?)

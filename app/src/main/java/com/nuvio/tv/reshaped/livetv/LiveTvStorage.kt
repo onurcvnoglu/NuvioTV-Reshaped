@@ -18,7 +18,7 @@ import org.json.JSONObject
 internal class LiveTvStorage(context: Context, private val profileId: Int) {
     private val prefs: SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-    private val playlistDir = File(context.applicationContext.filesDir, "live_tv")
+    private val playlistDir by lazy { File(context.applicationContext.filesDir, "live_tv") }
 
     private fun key(base: String) = "${base}_$profileId"
     private fun string(base: String): String? = prefs.getString(key(base), null)?.takeIf(String::isNotBlank)

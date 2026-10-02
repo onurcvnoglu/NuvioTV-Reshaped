@@ -27,6 +27,8 @@ import com.nuvio.tv.core.streams.supportsStreamResource
 import com.nuvio.tv.domain.model.enabledAddons
 import com.nuvio.tv.domain.repository.AddonRepository
 import com.nuvio.tv.domain.repository.StreamRepository
+import com.nuvio.tv.reshaped.livetv.IptvVodRepository
+import com.nuvio.tv.reshaped.livetv.IptvVodSource
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
@@ -57,6 +59,7 @@ class StreamRepositoryImpl @Inject constructor(
     private val localDebridAvailabilityService: LocalDebridAvailabilityService
 ) : StreamRepository {
     private val streamSearchSessions = StreamSearchSessionCache()
+    private val iptvVodRepository by lazy { IptvVodRepository(context, tmdbService) }
     private val localPluginSearchPaused = MutableStateFlow(false)
 
     override fun setLocalPluginSearchPaused(paused: Boolean) {
@@ -81,7 +84,8 @@ class StreamRepositoryImpl @Inject constructor(
         val enabledScrapers: List<ScraperInfo>,
         val groupPluginsByRepository: Boolean,
         val pluginRepositories: List<PluginRepository>,
-        val debridSettings: DebridSettings
+        val debridSettings: DebridSettings,
+        val iptvSources: List<IptvVodSource>
     )
 
     override fun getStreamsFromAllAddons(
@@ -91,7 +95,10 @@ class StreamRepositoryImpl @Inject constructor(
         episode: Int?,
         forceRefresh: Boolean
     ): Flow<NetworkResult<List<AddonStreams>>> = flow {
-        val sourceConfiguration = captureSourceConfiguration()
+        val sourceConfiguration = captureSourceConfiguration(
+            includeIptv = IptvVodRepository.supports(type),
+            forceRefresh = forceRefresh
+        )
         val requestKey = StreamSearchRequestKey(
             profileId = sourceConfiguration.profileId,
             type = type.lowercase(),
@@ -106,7 +113,8 @@ class StreamRepositoryImpl @Inject constructor(
                 pluginRepositories = sourceConfiguration.pluginRepositories,
                 debridPresentationConfiguration = sourceConfiguration.debridSettings
                     .withoutRawCredentials()
-                    .toString()
+                    .toString(),
+                iptvSourceFingerprints = sourceConfiguration.iptvSources.map { it.fingerprint }
             )
         )
 
@@ -123,13 +131,15 @@ class StreamRepositoryImpl @Inject constructor(
                     addons = sourceConfiguration.addons,
                     debridSettings = sourceConfiguration.debridSettings,
                     hasCompatiblePlugins = sourceConfiguration.pluginsEnabled &&
-                        sourceConfiguration.enabledScrapers.any { scraper -> scraper.supportsType(type) }
+                        sourceConfiguration.enabledScrapers.any { scraper -> scraper.supportsType(type) },
+                    profileId = sourceConfiguration.profileId,
+                    iptvSources = sourceConfiguration.iptvSources
                 )
             }
         )
     }
 
-    private suspend fun captureSourceConfiguration(): StreamSourceConfigurationSnapshot {
+    private suspend fun captureSourceConfiguration(includeIptv: Boolean, forceRefresh: Boolean): StreamSourceConfigurationSnapshot {
         while (true) {
             val profileId = profileManager.activeProfileId.value
             val addons = addonRepository.getInstalledAddons().first().enabledAddons()
@@ -138,6 +148,7 @@ class StreamRepositoryImpl @Inject constructor(
             val groupPluginsByRepository = pluginsEnabled && pluginManager.groupStreamsByRepository.first()
             val pluginRepositories = if (groupPluginsByRepository) pluginManager.repositories.first() else emptyList()
             val debridSettings = debridSettingsDataStore.settings.first()
+            val iptvSources = if (includeIptv) iptvVodRepository.captureSources(profileId, forceRefresh) else emptyList()
 
             if (profileManager.activeProfileId.value != profileId) continue
 
@@ -148,7 +159,8 @@ class StreamRepositoryImpl @Inject constructor(
                 enabledScrapers = enabledScrapers,
                 groupPluginsByRepository = groupPluginsByRepository,
                 pluginRepositories = pluginRepositories,
-                debridSettings = debridSettings
+                debridSettings = debridSettings,
+                iptvSources = iptvSources
             )
         }
     }
@@ -161,7 +173,9 @@ class StreamRepositoryImpl @Inject constructor(
         episode: Int?,
         addons: List<Addon>,
         debridSettings: DebridSettings,
-        hasCompatiblePlugins: Boolean
+        hasCompatiblePlugins: Boolean,
+        profileId: Int,
+        iptvSources: List<IptvVodSource>
     ): Flow<NetworkResult<List<AddonStreams>>> = flow {
         emit(NetworkResult.Loading)
 
@@ -171,7 +185,7 @@ class StreamRepositoryImpl @Inject constructor(
                 addon.supportsStreamResource(type, videoId)
             }
 
-            val attemptedAddonNames = streamAddons.map { it.displayName }
+            val attemptedAddonNames = streamAddons.map { it.displayName } + iptvSources.map { it.providerName }
             val attemptedFailures = java.util.Collections.synchronizedList(
                 mutableListOf<StreamAttemptFailure>()
             )
@@ -184,7 +198,7 @@ class StreamRepositoryImpl @Inject constructor(
                 val resultChannel = Channel<AddonStreams>(Channel.UNLIMITED)
                 
                 // Track number of pending jobs
-                val totalJobs = streamAddons.size + 1
+                val totalJobs = streamAddons.size + 1 + if (iptvSources.isEmpty()) 0 else 1
                 val completedJobs = java.util.concurrent.atomic.AtomicInteger(0)
 
                 // Launch addon jobs
@@ -283,10 +297,49 @@ class StreamRepositoryImpl @Inject constructor(
                     }
                 }
 
+                if (iptvSources.isNotEmpty()) {
+                    launch {
+                        try {
+                            iptvVodRepository.stream(
+                                profileId = profileId,
+                                sources = iptvSources,
+                                type = type,
+                                videoId = videoId,
+                                season = season,
+                                episode = episode,
+                                isActiveProfile = { profileManager.activeProfileId.value == profileId },
+                                onResult = { resultChannel.send(it) },
+                                onFailure = { providerName ->
+                                    attemptedFailures += StreamAttemptFailure(
+                                        addonName = providerName,
+                                        kind = StreamFailureKind.REQUEST_FAILED,
+                                        detail = context.getString(R.string.stream_error_detail_addon_request_failed)
+                                    )
+                                }
+                            )
+                        } catch (cancel: CancellationException) {
+                            throw cancel
+                        } catch (_: Exception) {
+                            // Do not log account-bearing URLs from provider or metadata errors.
+                            iptvSources.forEach { source ->
+                                attemptedFailures += StreamAttemptFailure(
+                                    addonName = source.providerName,
+                                    kind = StreamFailureKind.REQUEST_FAILED,
+                                    detail = context.getString(R.string.stream_error_detail_addon_request_failed)
+                                )
+                            }
+                        } finally {
+                            if (completedJobs.incrementAndGet() >= totalJobs) resultChannel.close()
+                        }
+                    }
+                }
+
                 // Emit results as they arrive
                 for (result in resultChannel) {
+                    if (profileManager.activeProfileId.value != profileId) throw CancellationException("Profile changed")
                     val checkingResult = localDebridAvailabilityService.markChecking(listOf(result)).firstOrNull() ?: result
                     val checkedResult = localDebridAvailabilityService.annotateCachedAvailability(listOf(checkingResult)).firstOrNull() ?: checkingResult
+                    if (profileManager.activeProfileId.value != profileId) throw CancellationException("Profile changed")
                     mergePresentedResult(accumulatedResults, checkedResult, debridSettings)
                     emit(NetworkResult.Success(accumulatedResults.toList()))
                     Log.d(TAG, "Emitted ${accumulatedResults.size} addon(s), latest: ${checkedResult.addonName} with ${checkedResult.streams.size} streams")
@@ -320,7 +373,8 @@ class StreamRepositoryImpl @Inject constructor(
         enabledScrapers: List<ScraperInfo>,
         groupPluginsByRepository: Boolean,
         pluginRepositories: List<PluginRepository>,
-        debridPresentationConfiguration: String
+        debridPresentationConfiguration: String,
+        iptvSourceFingerprints: List<String>
     ): String = buildString {
         append("addons:")
         addons.forEach { addon ->
@@ -337,6 +391,7 @@ class StreamRepositoryImpl @Inject constructor(
             }
         }
         append("|debrid:").append(debridPresentationConfiguration)
+        iptvSourceFingerprints.forEach { append("|iptv:").append(it) }
     }.sha256()
 
     private fun DebridSettings.withoutRawCredentials(): DebridSettings = copy(
